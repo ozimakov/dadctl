@@ -35,12 +35,21 @@
 ## Status
 
 Concept phase. The full vision, architecture sketch, MVP scope, roadmap, and
-the open questions that need answering before we write code live in:
+the in‑progress revision plan live in:
 
 * [`docs/superpowers/specs/2026-06-30-dadctl-concept-design.md`](docs/superpowers/specs/2026-06-30-dadctl-concept-design.md)
 
-Read it, push back, open issues. The design isn't done until we agree the open
-questions in §12 of that document.
+The seven foundational design decisions are recorded in §12; a seven‑role
+self‑review surfaced 24 follow‑on items, queued as **Step B** in §14 of that
+document and brainstormed one at a time. The implementation plan starts once
+Step B lands. The reviews themselves are in
+[`docs/superpowers/specs/reviews/2026-06-30-multi-role-self-review/`](docs/superpowers/specs/reviews/2026-06-30-multi-role-self-review/).
+
+Read it, push back, open issues.
+
+The MVP is explicitly a **developer‑parent beachhead on Linux/macOS** — not a
+general‑market parental‑control product. If your kid's primary device is a
+Windows laptop or a phone, dadctl isn't for you yet; see the §11 roadmap.
 
 ## License
 

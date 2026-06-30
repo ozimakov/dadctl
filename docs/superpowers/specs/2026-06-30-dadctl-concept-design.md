@@ -46,8 +46,10 @@ These are load‑bearing — every design choice should be checkable against the
    are limited to soft warnings and to enforcement steps the contract explicitly
    pre‑authorized.
 6. **Reliable, in both directions.** The daemon must be hard to crash and hard to
-   make over‑enforce. When the Hub is unreachable, the daemon errs on the side of
-   *warn, don't block*, and logs the gap.
+   make over‑enforce. When the Hub is unreachable, the daemon keeps enforcing the
+   contract the family last agreed to (the highest signed `version` it has seen),
+   never invents new escalations, and logs the offline gap so it is visible later.
+   See §9 and §12.2.
 7. **Contract as code, written in human.** Parents describe rules in natural
    language. The system compiles those rules into a structured policy that *both
    sides can read* and discuss.
@@ -212,10 +214,16 @@ LLM compiles to and what both parent and kid review. Three rule kinds:
 2. **Gates** — conditional access. "YouTube requires homework done today",
    "social apps allowed only after 16:00". Deterministic.
 3. **Expectations** — qualitative. "Be respectful in chats", "no violent video".
-   Designed in the DSL from day one so contracts written today won't have to be
-   rewritten later, but **not evaluated at runtime in MVP** (see §10). When we
-   turn them on (v0.3), they will be evaluated by the LLM analyzer and surfaced
-   as advisory issues only — never auto‑enforced.
+   The DSL reserves a slot for them so contracts written today don't have to be
+   rewritten later, but Expectations are **not evaluated at runtime in MVP** and
+   are intentionally **not on any committed roadmap version**. Two independent
+   reviewer roles flagged that LLM‑judged Expectations on a minor's private
+   communications is a fundamentally different product surface from screen‑time
+   metering — see [`reviews/2026-06-30-multi-role-self-review/`](reviews/2026-06-30-multi-role-self-review/).
+   Expectations are *design exploration only* until a dedicated communications‑
+   privacy and developmental design pass exists; if they ever ship, they will be
+   advisory‑only, opt‑in per expectation, and never gated on content inspection
+   by default.
 
 Each compiled rule carries the natural‑language sentence it came from so the kid
 can see *why* a rule exists, not just *what* it does.
@@ -224,7 +232,7 @@ can see *why* a rule exists, not just *what* it does.
 
 | Object | Key fields |
 |---|---|
-| `Contract` | `id`, `version`, `prose`, `compiled_policy`, `parent_sig`, `kid_acceptances[]` |
+| `Contract` | `id`, `version` (monotonic per Hub), `effective_at`, `prose`, `compiled_policy`, `parent_sig`, `kid_acknowledgments[]` |
 | `UsageEvent` | `device_id`, `ts`, `category`, `app_or_domain`, `seconds`, `metadata` |
 | `Issue` | `id`, `contract_version`, `severity`, `evidence_event_ids`, `analyzer_reasoning` |
 | `Decision` | `id`, `issue_id`, `actor` (`parent`/`hub`), `action`, `rationale`, `expires_at` |
@@ -233,6 +241,24 @@ can see *why* a rule exists, not just *what* it does.
 
 All objects are append‑only and signed. The kid has read access to every row
 about their own device. The parent has read access to all rows.
+
+**Contract monotonic versioning.** `Contract.version` is strictly increasing per
+Hub and is part of the signed payload. Each daemon stores the highest version it
+has successfully applied (`max_applied_contract_version`). The daemon refuses
+any contract presented to it whose version is lower than that watermark, even if
+otherwise validly signed. This closes a rollback attack where a kid blocks Hub
+connectivity, then feeds the daemon an older permissive contract restored from
+a backup or another device; a rollback attempt produces a signed
+`contract_rollback_attempt` event that surfaces in the parent's audit view on
+reconnect.
+
+**Note on `kid_acknowledgments`.** This field records that the kid saw the
+contract on a given day. It is **not** legal consent to data processing under
+COPPA, GDPR Art. 8, or any analogous regime — only the parent (or guardian
+holding parental responsibility) can give that. The field exists for procedural
+fairness and dispute resolution, not as a consent receipt. The retention,
+erasure, and lawful‑basis model for the data underneath is a Step B design
+section (see §14).
 
 ## 8. Threat model & trust assumptions
 
@@ -252,13 +278,24 @@ about their own device. The parent has read access to all rows.
 
 | Failure | Behavior |
 |---|---|
-| Hub unreachable | Daemon enforces last‑known contract, queues events, no new escalations, banner to kid: "offline, contract still active." |
+| Hub unreachable | Daemon enforces the **highest** signed contract version it has applied (`max_applied_contract_version`), queues events, raises no new escalations, banner to kid: "offline, contract still active." |
+| Contract rollback attempt | Daemon refuses any contract whose `version` is below `max_applied_contract_version` and emits a signed `contract_rollback_attempt` event surfaced to parent on reconnect. |
 | Daemon crash | Service auto‑restarts; gap logged as `daemon_gap` event so it can't hide. |
-| LLM unavailable | Deterministic Limits/Gates still apply; Expectations are paused with a banner in the parent UI. |
+| LLM unavailable | Deterministic Limits/Gates still apply; LLM‑augmented explanation paused with a banner in the parent UI. (Expectations are not evaluated at runtime in MVP regardless.) |
 | Clock skew | Hub authoritative, daemon resyncs on each connect; large skew flagged. |
-| Disputed enforcement | Kid can one‑click appeal; appeal pauses the enforcement for a parent‑configurable grace window (default 0 — i.e., no auto‑pause). |
+| Disputed enforcement | Kid can one‑click appeal; the grace window applied while the appeal is pending is a Step B design item (see §14, item 4 — *Developmental tiers & graduation*). Until that design lands, the spec does not commit a default. |
 
 ## 10. MVP scope (the cut)
+
+**Positioning.** The MVP is explicitly a **developer‑parent beachhead on
+Linux/macOS**, not a general‑market parental‑control product. The target first
+user is a parent who already self‑hosts something (Home Assistant, a NAS,
+Pi‑hole) and has a kid using a Linux or macOS laptop at home. This excludes the
+majority of real‑world kid devices (Windows desktops, iOS/Android phones and
+tablets) on purpose: those are post‑MVP, and we'd rather ship a coherent
+beachhead than a flaky multi‑platform v0. Several Step B sections (install
+redesign, parent‑absent fallback, governance) are precondition work for opening
+the audience beyond this beachhead.
 
 In:
 
@@ -283,7 +320,10 @@ Explicitly out:
 * Windows daemon (post‑MVP).
 * Mobile (Android post‑MVP; iOS is a separate research project — Screen Time API +
   MDM, harder).
-* Expectations (qualitative rules) — design only in MVP, not enabled.
+* Expectations (qualitative rules) — DSL slot only in MVP, not evaluated at
+  runtime, **not on any committed roadmap version** until a dedicated
+  communications‑privacy and developmental design pass exists. See §6 and
+  [`reviews/2026-06-30-multi-role-self-review/`](reviews/2026-06-30-multi-role-self-review/).
 * App‑level process suspension as an enforcement action.
 * Multi‑parent quorum decisions.
 * Federated viewers (grandparents, etc.).
@@ -292,12 +332,22 @@ Explicitly out:
 
 ## 11. Roadmap after MVP
 
+The roadmap is **capacity‑shaped, not calendar‑shaped**: each version ships when
+its preconditions are met, not on a fixed schedule.
+
 1. **v0.2 — Windows daemon, app‑level suspend, mobile companion notifications.**
-2. **v0.3 — Expectations rules enabled (with strong opt‑in and transparency).**
-3. **v0.4 — Multi‑kid, multi‑device, multi‑parent.**
-4. **v0.5 — Android daemon.**
-5. **v0.6 — Plugin SDK for collectors and enforcement adapters.**
-6. **v1.0 — Federated viewers, anomaly detection, contract templates marketplace.**
+2. **v0.3 — Multi‑kid, multi‑device, multi‑parent (decision quorum optional).**
+3. **v0.4 — Android daemon.**
+4. **v0.5 — Plugin SDK for collectors and enforcement adapters.**
+5. **v1.0 — Federated viewers, anomaly detection, contract templates marketplace.**
+
+**Expectations (qualitative LLM‑judged rules) are deliberately not scheduled.**
+The reviewer feedback in [`reviews/2026-06-30-multi-role-self-review/`](reviews/2026-06-30-multi-role-self-review/)
+(Privacy and Child Development independently) makes a case that the design
+question — "should we ever surface LLM judgments of a minor's private
+communications to a parent, and under what gates?" — is large enough to need its
+own brainstorm + spec round before it sits on a version line. We will revisit
+after the v0 Step B design sections settle.
 
 ## 12. Design decisions
 
@@ -354,20 +404,100 @@ the way it does.
 7. **Project telemetry — None.** No crash reports, no version pings, no install
    beacons. The only outbound calls a running install makes are (a) the LLM
    endpoint the parent configured, if any, and (b) Hub‑to‑daemon traffic on the
-   home network. Compensating UX requirement: the Hub UI must offer a one‑click
-   "copy diagnostic bundle" action that produces a scrubbed, parent‑reviewable
-   archive the parent can paste into a GitHub issue. This is a roadmap item, not
-   a telemetry item.
+   home network.
+
+   *Carve‑out: "no telemetry" is not "no security communications."* The project
+   ships a `SECURITY.md` and uses GitHub Security Advisories for coordinated
+   disclosure, and the Hub UI offers a **parent‑initiated** "check for updates"
+   action (queries the project's GitHub releases on demand only — no install
+   beacon, no automatic phone‑home, no payload identifying the install). The
+   bar is: the family decides when to talk to the network; the project never
+   decides on their behalf.
+
+   Compensating UX requirement: the Hub UI offers a one‑click "copy diagnostic
+   bundle" action that produces a scrubbed, parent‑reviewable archive the
+   parent can paste into a GitHub issue. The scrubbing rules (allowlist, parent
+   preview before export, automated tests on bundle contents) are a Step B
+   design item; the diagnostic bundle itself is in the §10 MVP cut.
 
 ## 13. What this document is not
 
-* It is not an implementation plan. The implementation plan is the next artifact,
-  produced via the writing‑plans skill once §12 is resolved.
-* It is not a marketing site. The README is the marketing surface.
+* It is not an implementation plan. The implementation plan is produced **after
+  Step B of the revision plan in §14** lands — not directly after this
+  document.
+* It is not a marketing site for parents. The README is the contributor‑facing
+  pitch; a parent‑facing docs site is a Step B deliverable.
 * It is not a final architecture. Specifics (broker choice, daemon language,
-  exact category taxonomy) are first‑pass and open to revision before code.
+  exact category taxonomy, signing scheme, auth model, retention rules) are
+  first‑pass and explicitly open to revision in Step B.
+
+## 14. Review history & revision plan
+
+This spec was self‑reviewed in parallel by seven role‑focused subagents on
+2026‑06‑30. The full reviews and a synthesis live in
+[`reviews/2026-06-30-multi-role-self-review/`](reviews/2026-06-30-multi-role-self-review/).
+Seven distinct lenses (security, privacy & child‑data legal, systems &
+deployability, AI/ML, family product/UX, open‑source community & sustainability,
+child development & family therapy) flagged 24 issues independently; roughly a
+third were flagged by two or more reviewers, which is the high‑confidence
+signal we acted on.
+
+### Step A — applied in this revision
+
+The current document already reflects:
+
+1. Resolved the §2 ⇄ §9 ⇄ §12.2 internal contradiction (principle 6 updated).
+2. Added contract monotonic versioning + anti‑rollback to §7 and §9.
+3. Renamed `kid_acceptances` → `kid_acknowledgments` and clarified they are
+   **not** legal consent (see note under §7).
+4. Clarified §12.7: "no telemetry" does not preclude `SECURITY.md`, GitHub
+   Security Advisories, or a parent‑initiated update check.
+5. Removed Expectations from the v0.3 roadmap; downgraded to *design
+   exploration only*, no committed version (§6, §10, §11).
+6. Made the MVP positioning explicit: **developer‑parent beachhead on
+   Linux/macOS**, not a general parental‑control product (§10).
+7. Added this §14 with the review pointer and the Step B queue.
+8. Updated §13 *What this document is not* to remove the now‑false claim that
+   the next artifact is the implementation plan.
+
+### Step B — open design sections, brainstormed one at a time
+
+Each item below is its own brainstorming round (multiple choice → user decision
+→ spec section). The order matters: earlier items are preconditions for later
+ones. The implementation plan only starts once these have landed.
+
+1. **Cryptography & identity model** — key types, custody, rotation, `parent_sig`
+   envelope, daemon‑side offline signature verification.
+2. **Hub parent authentication & pairing security parameters** — auth model
+   (password / passkey / both), one‑time pairing code entropy/TTL/rate‑limit,
+   mTLS PKI lifecycle (CA protection, rotation, revocation, broker ACLs),
+   kid‑vs‑parent endpoint separation.
+3. **Retention, erasure & operator legal roles** — GDPR/COPPA‑compatible
+   deletion model on top of an append‑only event store, operator‑as‑controller
+   framing, pre‑collection consent flow, kid‑facing privacy notice, third‑party
+   LLM warning + opt‑in.
+4. **Developmental tiers & graduation** — banded UX (8–10 / 11–13 / 14–17),
+   age‑banded contract templates, autonomy off‑ramp, crisis safe‑harbor
+   categories that cannot be gated off, appeal grace‑window defaults,
+   daily‑acceptance triggers (change‑gated vs. daily).
+5. **Parent‑absent fallback & inbox UX** — what happens when the parent
+   doesn't respond; batching, parent quiet hours, "conversation beat" before
+   punitive one‑taps, kid and parent day‑in‑the‑life flows.
+6. **Install & onboarding redesign** — 15‑minute first‑run, bundled prose
+   templates, rules‑only default, reachability tier (LAN‑only vs. overlay /
+   tunnel vs. small cloud Hub), parent notification surface beyond PWA/WebPush
+   (esp. iOS).
+7. **Governance, security disclosure, sustainability** — initial maintainer
+   model, release signing key custody, `SECURITY.md`, `CONTRIBUTING.md`, code
+   of conduct, year‑two sustainability path (donations / managed hosting /
+   grants), bus‑factor stance.
+8. **Brand check** — keep `dadctl` as the dev codename and choose a separate
+   parent‑facing brand, or rename now while the cost is zero.
+
+Step B may surface its own follow‑on questions; we revisit this list at the end
+of each round.
 
 ---
 
-*Status: design decisions resolved. Next action: invoke the writing‑plans skill
-to produce a detailed implementation plan for the MVP scope in §10.*
+*Status: Step A applied. Next action: brainstorm Step B item 1 — Cryptography &
+identity model.*

@@ -44,5 +44,5 @@ questions in §12 of that document.
 
 ## License
 
-To be confirmed (the spec proposes AGPL‑3.0 for the Hub and daemon, MIT for any
-SDKs). See §12 of the concept doc.
+**Apache‑2.0** for the entire project (Hub, daemon, SDKs, schemas). See §12.3
+of the concept doc for the rationale.

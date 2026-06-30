@@ -179,9 +179,12 @@ parent. Non‑acceptance never silently widens enforcement — it just gets logg
   Owns the escalation ladder: first breach → soft warning, repeated → hard warning
   or grounding, severe → grounding + parent notify.
 * **API** — REST for CRUD, WebSocket for live events, MQTT bridge for daemons.
-* **LLM backend abstraction** — pluggable. MVP supports two: OpenAI‑compatible
-  endpoint (incl. local Ollama) and a strict "rules‑only, no LLM" mode for the
-  paranoid.
+* **LLM backend abstraction** — pluggable. MVP supports two backends plus a
+  zero‑LLM mode: **Ollama (local, the default)**, an **OpenAI‑compatible
+  endpoint** the parent can switch to in settings, and a strict **"rules‑only,
+  no LLM"** mode for parents who don't want any model in the loop. Only one
+  backend is active at a time. Switching backends is a parent‑only setting and
+  is *not* surfaced in the kid's History.
 
 ### 5.3 Parent client
 
@@ -266,8 +269,14 @@ In:
 * Enforcement actions: soft warning, hard warning, session lock.
 * Web parent client (PWA), kid tray app + Today page.
 * Self‑hosted Hub via `docker compose up`.
-* LLM backend abstraction with two adapters: OpenAI‑compatible, Ollama.
+* LLM backend abstraction with two adapters (Ollama default, OpenAI‑compatible
+  optional) plus a rules‑only mode.
 * Append‑only signed history with kid‑readable view.
+* Pairing flow: daemon prints a one‑time code, parent enters it in the Hub UI,
+  Hub issues the per‑device mTLS certificate.
+* Apache‑2.0 license headers and `LICENSE` / `NOTICE` files in the repo.
+* In‑Hub "copy diagnostic bundle" action (scrubbed archive for manual bug
+  reports; offsets the lack of telemetry).
 
 Explicitly out:
 
@@ -290,33 +299,65 @@ Explicitly out:
 5. **v0.6 — Plugin SDK for collectors and enforcement adapters.**
 6. **v1.0 — Federated viewers, anomaly detection, contract templates marketplace.**
 
-## 12. Open questions (need a human call)
+## 12. Design decisions
 
-These are the decisions that should shape the implementation plan; flagging them
-here so the next pass picks one explicitly per item.
+The seven questions originally raised in this section have been resolved. They
+are recorded here with their final answer and a short rationale, so the
+implementation plan and any future contributor can trace why the system behaves
+the way it does.
 
-1. **LLM default location.** Local (Ollama, slower, more private) vs. cloud
-   (OpenAI‑compatible, faster, more capable). Proposal: **Ollama by default**,
-   one‑click switch to cloud, never both silently.
-2. **Failure stance.** When Hub is unreachable, do we **enforce last‑known**
-   contract or **warn‑only**? Proposal: **enforce last‑known**, with a kid‑visible
-   "offline" banner and no new escalations.
-3. **License.** **AGPL‑3.0** keeps forks honest about source availability, which
-   matches the "auditable for the family" promise. Alternative: MIT for broader
-   adoption. Proposal: **AGPL‑3.0** for the Hub and daemon, MIT for the SDKs.
-4. **Identity model.** Bind to the OS account on the device, or have a dadctl
-   account that maps to the OS account at pairing? Proposal: **pairing model** —
-   one OS account on one device = one `device_id` in the Hub.
-5. **Contract ground truth.** Compiled YAML is canonical and the prose is a
-   *comment*, or the prose is canonical and we re‑compile? Proposal: **compiled
-   YAML is canonical**, prose stored alongside, re‑compile produces a *proposal*
-   that needs parent signature before it takes effect.
-6. **Kid age threshold for appeal weight.** The appeal mechanism is the same at
-   all ages, but should default decisions differ for younger vs. older kids?
-   Proposal: **no age‑based defaults in MVP** — keep behavior uniform, let parents
-   tune.
-7. **Telemetry from the project itself.** None by default; opt‑in crash reports
-   only, sent to a self‑hosted Sentry the project runs. Confirm.
+1. **LLM default location — Local (Ollama) by default, one‑click switch to an
+   OpenAI‑compatible endpoint.** A brand‑new install never sends data off the
+   home network until the parent explicitly opts in. Cost: heavier first‑run
+   experience (default small model, e.g. 8B class, downloaded on first boot); a
+   "rules‑only, no LLM" escape hatch is available for parents who don't want any
+   model at all. Hub never runs both backends silently. **The backend identity
+   (which model, local vs. cloud) is parent‑facing only and is not surfaced in
+   the kid's History view** — kid transparency is about contracts, decisions,
+   and reasoning, not infrastructure.
+
+2. **Hub‑unreachable failure stance — Enforce last‑known contract, no new
+   escalations.** The deterministic engine keeps running against the most
+   recently synced contract. Existing decisions persist. New Issues are not
+   raised while offline. The kid sees an "offline" banner. Events queue locally
+   and flush on reconnect. The offline gap is itself a logged event so it can be
+   reviewed later.
+
+3. **License — Apache‑2.0 for the entire project** (Hub, daemon, SDKs, protocol
+   schemas). Permissive license maximizes adoption and community contribution.
+   We accept the trade‑off that a vendor could build a closed‑source "dadctl
+   Pro"; the trust signal of "you can audit the upstream we ship" plus the
+   self‑hostable design is our defense rather than copyleft. Apache‑2.0 is
+   preferred over MIT for its explicit patent grant.
+
+4. **Identity model — Pairing model.** Each device pairs to the Hub at install
+   time via a one‑time code displayed by the daemon. The Hub stores a
+   `(device_id, kid_label)` mapping. Kids do not sign in — the device *is* the
+   identity. Multi‑device per kid is supported by pairing each device and
+   grouping `device_id`s under the same kid label. The compiled policy decides
+   whether budgets aggregate across grouped devices.
+
+5. **Contract ground truth — Compiled policy is canonical.** The deterministic
+   engine evaluates the compiled YAML, which is signed and versioned. The prose
+   is stored alongside as the human source. Re‑editing the prose produces a
+   *proposal* — a diff against the current compiled policy — which the parent
+   must sign before it takes effect. This guarantees determinism in the hot
+   path: the kid being warned or grounded can always point at one specific
+   signed rule.
+
+6. **Age‑based defaults — None.** The engine treats every kid identically.
+   Age‑appropriateness is whatever the parent encodes in the contract prose.
+   This avoids embedding our own editorial judgment about what a "12‑year‑old"
+   should be allowed. Contract templates may appear in a later release once
+   we have signal from real families about what defaults *they* settled on.
+
+7. **Project telemetry — None.** No crash reports, no version pings, no install
+   beacons. The only outbound calls a running install makes are (a) the LLM
+   endpoint the parent configured, if any, and (b) Hub‑to‑daemon traffic on the
+   home network. Compensating UX requirement: the Hub UI must offer a one‑click
+   "copy diagnostic bundle" action that produces a scrubbed, parent‑reviewable
+   archive the parent can paste into a GitHub issue. This is a roadmap item, not
+   a telemetry item.
 
 ## 13. What this document is not
 
@@ -328,5 +369,5 @@ here so the next pass picks one explicitly per item.
 
 ---
 
-*Status: draft for review. Next action: resolve §12, then move to implementation
-plan.*
+*Status: design decisions resolved. Next action: invoke the writing‑plans skill
+to produce a detailed implementation plan for the MVP scope in §10.*

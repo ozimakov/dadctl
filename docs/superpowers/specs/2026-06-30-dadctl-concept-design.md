@@ -466,12 +466,12 @@ Each item below is its own brainstorming round (multiple choice → user decisio
 → spec section). The order matters: earlier items are preconditions for later
 ones. The implementation plan only starts once these have landed.
 
-1. **Cryptography & identity model** — key types, custody, rotation, `parent_sig`
-   envelope, daemon‑side offline signature verification.
+1. ~~**Cryptography & identity model**~~ — **landed as §15.**
 2. **Hub parent authentication & pairing security parameters** — auth model
-   (password / passkey / both), one‑time pairing code entropy/TTL/rate‑limit,
-   mTLS PKI lifecycle (CA protection, rotation, revocation, broker ACLs),
-   kid‑vs‑parent endpoint separation.
+   details beyond password (§15.5 already covers password hygiene; this round
+   covers session management, CSRF, kid‑vs‑parent endpoint separation),
+   one‑time pairing code entropy/TTL/rate‑limit, mTLS PKI lifecycle (CA
+   protection, rotation, revocation, broker ACLs).
 3. **Retention, erasure & operator legal roles** — GDPR/COPPA‑compatible
    deletion model on top of an append‑only event store, operator‑as‑controller
    framing, pre‑collection consent flow, kid‑facing privacy notice, third‑party
@@ -497,7 +497,153 @@ ones. The implementation plan only starts once these have landed.
 Step B may surface its own follow‑on questions; we revisit this list at the end
 of each round.
 
+## 15. Cryptography & identity
+
+*Step B item 1. Landed 2026‑07‑03.*
+
+### 15.1 What gets signed and by whom
+
+| Object | Signed by | Notes |
+|---|---|---|
+| `Contract` | Parent | Covers `id`, `version`, `effective_at`, `prose`, `compiled_policy` |
+| `Decision` (`actor: parent`) | Parent | The routine case |
+| `Decision` (`actor: hub`) | Hub | Only when the contract pre‑authorized this auto‑action |
+| `Issue` | Hub | Record of what the analyzer found; not an authority statement |
+| `EnforcementRecord` | Device | The daemon proves it applied the decision |
+| `Appeal` | Kid (device‑witnessed) + Parent (response) | Kid signature is a record, not authority |
+| `UsageEvent` | Device, in checkpointed batches | Per‑event signing at monitoring cadence would be wasteful |
+| `KeyRotation` envelope | Old key + new key (co‑signed) | The audit‑visible way authority moves |
+
+### 15.2 Three key identities
+
+- **Parent key** — Ed25519 keypair. Pubkey pinned at pairing on every daemon.
+  Private key held by whichever authenticator is currently bound to the parent
+  identity (see §15.4).
+- **Hub key** — Ed25519 keypair generated at Hub install. Pubkey distributed to
+  daemons at pairing. Private key held by the Hub process.
+- **Device key** — Ed25519 keypair generated on each daemon at pairing. Pubkey
+  registered with Hub. Private key never leaves the device.
+
+Ed25519 is chosen for all three: small, fast, deterministic, universally
+supported. No hardware security module is required.
+
+### 15.3 Signature envelope
+
+Canonical serialization is **JSON Canonical Form (RFC 8785)** — human‑readable
+so the audit view can literally show the bytes that were signed. Deterministic
+(sorted keys, canonical numbers) so two daemon implementations cannot disagree
+about what a `Contract` hashed to.
+
+```json
+{
+  "payload": { ... canonical object fields ... },
+  "signatures": [
+    {
+      "signer": "parent",
+      "key_id": "parent-2026-07",
+      "alg": "Ed25519",
+      "sig": "base64url(...)"
+    }
+  ]
+}
+```
+
+Multiple signatures are allowed on a single envelope — this is the mechanism
+for Hub co‑signing an auto‑Decision, and later for a co‑parent's second
+signature.
+
+### 15.4 The authenticator abstraction — "leave room for later"
+
+The Hub records the parent identity like this:
+
+```
+parent_identity {
+  id: "parent-1",
+  authenticators: [
+    { kind: "password", enrolled_at: ..., active: true }
+  ],
+  active_signing_key: "parent-2026-07"  // pubkey ref
+}
+```
+
+`parent_sig` is *not* "a password‑signed thing"; it is "a signature by whichever
+authenticator is currently bound to the parent identity." Adding a WebAuthn
+passkey later — or a hardware key, or a phone‑push authenticator — is a **new
+enrollment**, not a schema change:
+
+1. Parent authenticates with the currently active authenticator (password).
+2. Enrolls a new authenticator (e.g., WebAuthn passkey), generating a new
+   Ed25519 signing key wrapped by that authenticator.
+3. Hub writes a `KeyRotation` event to the signed history:
+   `{ from: parent-2026-07, to: parent-2026-11, authorized_by: password,
+   authorized_at: ... }`. The event is co‑signed by the old key.
+4. Daemons accept both keys during a 30‑day overlap window, then only the new
+   one.
+5. The kid's audit view shows the transition as a first‑class event ("parent
+   authority moved from password to passkey on 2026‑07‑15").
+
+Same abstraction later covers hardware key, phone‑push, and a co‑parent second
+signature. The MVP ships **only the password authenticator**, but the schema,
+the `KeyRotation` primitive, and the daemon's multi‑key acceptance window are
+present from day one so no future migration is a breaking change.
+
+### 15.5 Password hygiene (the only thing between an attacker and forgery in MVP)
+
+- Minimum 12 characters, zxcvbn strength estimator shown at set time (warns
+  but does not block).
+- **Argon2id** at rest, parameters tuned to ≥250 ms on target Hub hardware.
+- Login rate‑limit: 5 attempts per 15 minutes per source IP; exponential
+  lockout on the parent account.
+- The Hub is bound to `localhost` by default. Any remote access requires the
+  parent to explicitly stand up a reverse proxy or an overlay network — that
+  conversation is Step B.6 (install & onboarding).
+- **No password recovery via email or security questions.** The parent writes
+  down a one‑shot recovery code at first‑run (16 characters, base32, decrypts
+  the Hub keystore exactly once). Losing both password and recovery code
+  means starting fresh as a new parent identity — past records still verify
+  against the old pubkey, new records sign under the new key, and the kid
+  sees the transition in the audit log.
+
+Email recovery is deliberately absent: it would create a silent alternate
+authority (the parent's email provider) with the power to reset the family's
+Hub. That is worse than "you lose two things, you start fresh."
+
+### 15.6 Rotation and revocation
+
+- **Planned rotation** — parent authenticates, Hub generates a new keypair,
+  writes a `KeyRotation` event co‑signed old+new. Daemons accept both keys for
+  a 30‑day overlap window.
+- **Suspected compromise** — parent triggers `KeyRevoke`. Old key is
+  immediately invalid for *new* signatures; existing records still verify.
+  Daemons refuse any newly‑arrived record signed by the revoked key.
+- **Hub key rotation** — same pattern; daemons discover the new Hub pubkey
+  over the mutually‑authenticated Hub connection (mTLS details are Step B.2).
+
+### 15.7 Trust chain
+
+```
+Parent (pubkey pinned at pairing)
+    ├── signs → Contract, Decision(parent-actor)
+Hub (pubkey pinned at pairing)
+    ├── signs → Issue, Decision(hub-actor), KeyRotation envelopes
+Device (pubkey registered at pairing)
+    └── signs → EnforcementRecord, UsageEvent checkpoints
+```
+
+Every object in §7 traces back to exactly one of these three authority roots.
+
+### 15.8 What §15 deliberately does not do (yet)
+
+- No hardware‑security‑module requirement.
+- No Merkle tree over the audit log at the object level (per‑object signing is
+  enough for family scale; a small Merkle root per `UsageEvent` batch is the
+  one exception).
+- No transparency log / external witnesses (a v1.0+ topic if we ever want the
+  audit log to be verifiable outside the family).
+- No cross‑signing between families or federated hubs (v1.0 item).
+- No PKI / mTLS specifics for transport — that is Step B.2.
+
 ---
 
-*Status: Step A applied. Next action: brainstorm Step B item 1 — Cryptography &
-identity model.*
+*Status: Step B item 1 landed as §15. Next action: brainstorm Step B item 2 —
+Hub parent authentication & pairing security parameters.*

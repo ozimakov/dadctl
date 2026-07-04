@@ -55,6 +55,12 @@ These are load‑bearing — every design choice should be checkable against the
    sides can read* and discuss.
 8. **Append‑only history.** Events, decisions, and overrides are signed and
    never silently rewritten. A grounded kid can prove the grounding ended.
+9. **Standard proven pieces over new code.** Where a mature protocol, library,
+   or component exists that fits the requirement, we use it — even at the cost
+   of a slightly imperfect fit. Every line of code we write is a line we have
+   to secure, debug, and maintain; every dependency we pull in has a community
+   that shares that cost with us. New code is the exception, not the default.
+   The concrete stack that follows from this principle is in §16.
 
 ## 3. Personas
 
@@ -150,8 +156,17 @@ parent. Non‑acceptance never silently widens enforcement — it just gets logg
 
 ### 5.1 Local daemon (`dadctld`)
 
-* **Language:** Rust (preferred) or Go. Single static binary, runs as a system
-  service (systemd / launchd / Windows service).
+* **Language:** **.NET 10 (C# 14)**, published AOT‑compiled and self‑contained
+  per target OS (Linux x64/arm64 + macOS arm64/x64 for MVP; Windows x64
+  post‑MVP). Chosen over Rust and Go for two decisive reasons: `.NET for
+  macOS` gives production‑quality AppKit / IOKit / Accessibility bindings so
+  the client‑side pain surface (foreground‑app collection, idle detection,
+  TCC prompts, session lock, launchd integration) does not have to be
+  hand‑rolled, and one‑language reuse with the Hub (§5.2) lets the wire
+  protocol, canonical serialization, signing, and MQTT topic conventions live
+  in a single shared class library (`Dadctl.Protocol`). Full stack in §16.
+  Runs as a system service via `Microsoft.Extensions.Hosting` (systemd on
+  Linux, launchd on macOS, Windows Service post‑MVP).
 * **Collectors** — pluggable, each one a separate process or module:
   * Foreground app + window title category (privacy‑preserving: title hashed or
     redacted unless the contract requires text inspection).
@@ -166,43 +181,75 @@ parent. Non‑acceptance never silently widens enforcement — it just gets logg
   * App‑level suspend (SIGSTOP / platform API), opt‑in per category.
 * **Local buffer:** SQLite WAL. The daemon must function offline for at least 24 h
   with no quality loss; events sync when the Hub returns.
-* **Kid UI:** small tray app + a "today" page reachable from the tray. Always shows:
-  budget remaining, what's currently active in the contract, last alert and why,
-  how to file an appeal.
+* **Kid UI:** small tray app + a "Today" page reachable from the tray,
+  implemented with **Avalonia 11+** (native tray on macOS/Windows/Linux,
+  native windows, MVVM via CommunityToolkit.Mvvm). Always shows: budget
+  remaining, what's currently active in the contract, last alert and why,
+  how to file an appeal. Kid‑UX daily flows and copy are a Step B item.
 
 ### 5.2 Hub server (`dadctl-hub`)
 
-* Single binary or Docker image. Brings its own MQTT broker (embedded) for
-  zero‑config installs, can also point at an existing broker.
-* **Contract store** — versioned, signed, immutable history.
-* **Analyzer** — schedules evaluations (cron + threshold), calls the LLM backend,
-  produces `Issue` records with structured evidence + reasoning text.
-* **Decision engine** — turns `Issue` into one or more candidate `Decision` objects.
-  Owns the escalation ladder: first breach → soft warning, repeated → hard warning
-  or grounding, severe → grounding + parent notify.
-* **API** — REST for CRUD, WebSocket for live events, MQTT bridge for daemons.
+* **Language:** **.NET 10 (C# 14)** on **ASP.NET Core** (minimal APIs). AOT
+  single‑file publish → ~50 MB container image on
+  `mcr.microsoft.com/dotnet/runtime-deps:10.0-chiseled`. Shared class library
+  (`Dadctl.Protocol`) with the daemon.
+* **MQTT broker:** **Mosquitto** as an external service in the docker‑compose
+  file — not embedded. Standard, packaged in every distro, minimal ops
+  surface, decades of hardening.
+* **Contract store** — versioned, signed, immutable history (SQLite via EF Core
+  for MVP, migration path to Postgres).
+* **Analyzer** — schedules evaluations via `Quartz.NET`, calls the LLM backend
+  through **Semantic Kernel** for structured‑output + verifier loops, produces
+  `Issue` records with structured evidence + reasoning text.
+* **Decision engine** — turns `Issue` into one or more candidate `Decision`
+  objects. Owns the escalation ladder: first breach → soft warning, repeated →
+  hard warning or grounding, severe → grounding + parent notify.
+* **API** — REST + WebSockets (native ASP.NET Core), OpenAPI at `/openapi`, no
+  MQTT bridge on the API surface (daemons connect to Mosquitto directly).
 * **LLM backend abstraction** — pluggable. MVP supports two backends plus a
-  zero‑LLM mode: **Ollama (local, the default)**, an **OpenAI‑compatible
-  endpoint** the parent can switch to in settings, and a strict **"rules‑only,
-  no LLM"** mode for parents who don't want any model in the loop. Only one
-  backend is active at a time. Switching backends is a parent‑only setting and
-  is *not* surfaced in the kid's History.
+  zero‑LLM mode: **Ollama (local, the default)** via `OllamaSharp`, an
+  **OpenAI‑compatible endpoint** (via the official `OpenAI` SDK) the parent
+  can switch to in settings, and a strict **"rules‑only, no LLM"** mode for
+  parents who don't want any model in the loop. Only one backend is active at
+  a time. Switching backends is a parent‑only setting and is *not* surfaced
+  in the kid's History.
 
 ### 5.3 Parent client
 
-* Progressive web app served by the Hub. No app store required for MVP.
+* Progressive web app served by the Hub — **Blazor WebAssembly** with the
+  `Dadctl.Protocol` types shared with the Hub (no DTO duplication). Bundle
+  cached via Service Worker after first load.
 * Push notifications via WebPush.
-* Critical surfaces: **Inbox** (pending issues + suggested decisions), **Contract**
-  editor, **History** timeline, **Devices**.
+* Critical surfaces: **Inbox** (pending issues + suggested decisions),
+  **Contract** editor, **History** timeline, **Devices**.
+* No app‑store‑distributed native app in MVP; a native mobile companion is
+  post‑MVP (§11).
 
 ### 5.4 Messaging
 
-* MQTT 3.1.1 over TLS with per‑device client certificates issued by the Hub on
-  pairing. Retained `device/<id>/status` topic for liveness, `device/<id>/events`
-  for `UsageEvent`, `device/<id>/decisions` for `Decision` push.
-* Why MQTT for MVP: low overhead on flaky home networks, retained messages help
-  with offline/online transitions, mature client libraries across languages. NATS
-  is a reasonable alternative we can revisit if we outgrow MQTT.
+* **MQTT 3.1.1 over TLS** (WebSocket transport on port 443 is the default so
+  the protocol traverses school and coffee‑shop firewalls; raw MQTT on 8883
+  is available for LAN‑only deployments). Broker is **Mosquitto**. Client is
+  **MQTTnet** (both daemon and Hub — the same library).
+* **Topics:** retained `device/<id>/status` for liveness (with MQTT Last Will
+  and Testament for free daemon‑down detection), `device/<id>/events` for
+  `UsageEvent` batches, `device/<id>/decisions` for `Decision` push. Per‑device
+  ACLs at the broker so device A cannot subscribe or publish to device B's
+  topics.
+* **Authenticity is not carried by MQTT or TLS.** Every payload is a signed
+  envelope per §15 — the parent key signs Contracts and Decisions, the Hub
+  key signs Issues and hub‑actor Decisions, the device key signs
+  EnforcementRecords and UsageEvent checkpoints. MQTT provides delivery, TLS
+  provides confidentiality on the wire, signatures provide authority. Any of
+  those layers can be swapped without touching the others.
+* **QoS strategy:** `QoS 1 at‑least‑once` for `events` and `decisions` (dedup
+  by sequence number in the signed envelope); `QoS 0` for high‑volume liveness
+  pings; `QoS 2` reserved and unused in MVP.
+* **Why MQTT** — mature standard with battle‑tested broker (Mosquitto), rich
+  client libraries in every language, semantics (retained messages, LWT, QoS
+  levels) that map cleanly to our shape without us writing them, existing
+  operator tooling (`mqtt-explorer`, `mosquitto_sub` for debug). This is a
+  direct application of principle 9.
 
 ## 6. The contract DSL
 
@@ -471,7 +518,9 @@ ones. The implementation plan only starts once these have landed.
    details beyond password (§15.5 already covers password hygiene; this round
    covers session management, CSRF, kid‑vs‑parent endpoint separation),
    one‑time pairing code entropy/TTL/rate‑limit, mTLS PKI lifecycle (CA
-   protection, rotation, revocation, broker ACLs).
+   protection, rotation, revocation, broker ACLs). Most of the auth
+   plumbing here is delegated to first‑party ASP.NET Core middleware per
+   §16, so this round is smaller than originally scoped.
 3. **Retention, erasure & operator legal roles** — GDPR/COPPA‑compatible
    deletion model on top of an append‑only event store, operator‑as‑controller
    framing, pre‑collection consent flow, kid‑facing privacy notice, third‑party
@@ -643,7 +692,148 @@ Every object in §7 traces back to exactly one of these three authority roots.
 - No cross‑signing between families or federated hubs (v1.0 item).
 - No PKI / mTLS specifics for transport — that is Step B.2.
 
+## 16. Stack & dependencies
+
+*Landed 2026‑07‑04 during Step B.2 discussion, following the addition of
+principle 9 (§2). This section is the concrete instantiation of that principle.*
+
+### 16.1 Language and runtime
+
+**.NET 10 (C# 14)**, one language across the whole project. Chosen over
+alternatives (Python, Go, Rust) after explicit trade‑off analysis captured in
+this branch's PR history. The decisive reasons:
+
+- `.NET for macOS` (the mature Xamarin.Mac lineage folded into .NET)
+  eliminates the client‑side pain surface on macOS that any of the
+  alternatives would have made us hand‑roll: foreground‑app collection, idle
+  detection, TCC permission prompts, session lock, launchd integration.
+- **Semantic Kernel** covers the LLM compile‑verify‑simulate loop the AI
+  review made mandatory, closing the ecosystem gap that would have made Go
+  or Rust more work at the analyzer layer.
+- One shared class library (`Dadctl.Protocol`) between the Hub and the
+  daemon absorbs all the wire‑type, canonical‑serialization, signing, and
+  MQTT‑topic boilerplate.
+- Windows daemon at v0.2 (§11) becomes essentially the same code path.
+
+Deployment cost is a somewhat larger container image than a Go static binary
+(~50 MB vs ~20 MB via AOT single‑file publish onto a chiseled runtime image)
+and a slightly slower cold start. Both are acceptable for a self‑hosted Hub
+that runs continuously.
+
+### 16.2 Solution layout
+
+One `.sln`:
+
+```
+src/
+  Dadctl.Protocol/            # shared: types, canonical JSON, signature envelopes, MQTT topics
+  Dadctl.Crypto/              # shared: Ed25519, Argon2id, key rotation primitives
+  Dadctl.Hub/                 # ASP.NET Core minimal APIs, Semantic Kernel analyzer
+  Dadctl.Daemon/              # cross-platform daemon core, MQTT client, enforcer
+  Dadctl.Client.Mac/          # AppKit / IOKit / Accessibility bindings
+  Dadctl.Client.Linux/        # DBus + X11 P/Invoke bindings
+  Dadctl.Client.Windows/      # (post-MVP)
+  Dadctl.Ui.Avalonia/         # tray + Today page views
+  Dadctl.Pwa/                 # Blazor WebAssembly parent client
+tests/
+  Dadctl.Tests.Protocol/
+  Dadctl.Tests.Hub/
+  Dadctl.Tests.Daemon/
+```
+
+### 16.3 Component picks
+
+**Shared (both binaries and the PWA where relevant):**
+
+| Concern | Pick | Notes |
+|---|---|---|
+| Ed25519 signing | **`NSec.Cryptography`** | libsodium binding, actively maintained |
+| Argon2id | **`Konscious.Security.Cryptography.Argon2`** | de‑facto .NET Argon2 |
+| Canonical JSON (RFC 8785) | Small internal impl in `Dadctl.Protocol` (~150 lines over `System.Text.Json`) | No first‑class .NET library exists; JCS is small enough to own |
+| MQTT client | **`MQTTnet`** | Supports 3.1.1 + 5, WebSocket transport, TLS, all QoS levels |
+| SQLite | **`Microsoft.Data.Sqlite`** | First‑party ADO.NET provider |
+| ORM + migrations | **Entity Framework Core** | First‑party |
+| Logging | `Microsoft.Extensions.Logging` + **Serilog** sink | Structured JSON to stdout |
+| Config, DI, hosting | `Microsoft.Extensions.{Configuration,DependencyInjection,Hosting}` | First‑party |
+| Tests | **xUnit** + **FluentAssertions** + **NSubstitute** | Standard |
+
+**Hub:**
+
+| Concern | Pick |
+|---|---|
+| Web framework | **ASP.NET Core** minimal APIs |
+| WebSocket | Built into ASP.NET Core; **SignalR** as optional convenience layer |
+| MQTT broker | **Mosquitto** as external service in docker‑compose |
+| Cookie auth + CSRF | `Microsoft.AspNetCore.Authentication.Cookies` + `Microsoft.AspNetCore.Antiforgery` |
+| Rate limiting | `Microsoft.AspNetCore.RateLimiting` |
+| WebAuthn (for §15.4 later authenticators) | **`Fido2NetLib`** |
+| LLM tooling | **Semantic Kernel** + official **`OpenAI`** SDK + **`OllamaSharp`** |
+| Scheduler | **`Quartz.NET`** |
+| HTTP resilience | `Microsoft.Extensions.Http.Resilience` (Polly) |
+| Metrics | **OpenTelemetry** for .NET |
+| API docs | `Microsoft.AspNetCore.OpenApi` |
+
+**Daemon:**
+
+| Concern | Pick |
+|---|---|
+| UI (tray + Today page) | **Avalonia 11+** with **CommunityToolkit.Mvvm** |
+| Service lifecycle | `Microsoft.Extensions.Hosting.Systemd` (Linux), custom launchd wrapper for macOS (~50 lines), `Microsoft.Extensions.Hosting.WindowsServices` (post‑MVP) |
+| macOS native APIs | **.NET for macOS** bindings (AppKit / IOKit / Accessibility / Foundation) |
+| Linux native APIs | **`Tmds.DBus`** + P/Invoke for X11 primitives |
+
+**Parent PWA:**
+
+| Concern | Pick |
+|---|---|
+| Framework | **Blazor WebAssembly** |
+| UI kit | (Deferred to Step B item on parent UX — likely **MudBlazor** or similar) |
+| WebPush | Standard browser `PushManager` API + a Hub‑side WebPush library (TBD in Step B.5) |
+| State | Blazor's built‑in DI + `Dadctl.Protocol` DTOs (no duplicate models) |
+
+**Cross‑cutting:**
+
+| Concern | Pick |
+|---|---|
+| Container image (Hub) | AOT single‑file on `mcr.microsoft.com/dotnet/runtime-deps:10.0-chiseled` — ~50 MB |
+| Native packaging (daemon) | `dotnet publish --self-contained -r <rid>`, wrapped in `.deb`/`.rpm`/signed macOS `.pkg` |
+| Release signing | **`cosign`** (Sigstore) |
+| Local‑dev orchestration | **.NET Aspire** — first‑party, spins up Hub + Mosquitto + Ollama with one command |
+| CI | GitHub Actions |
+| Docs site | MkDocs Material |
+
+### 16.4 Honest gaps in the reuse story
+
+- **JCS (RFC 8785) has no first‑class .NET library.** We own ~150 lines in
+  `Dadctl.Protocol`. Cheaper than depending on an unmaintained community
+  port; the spec is small and stable.
+- **macOS launchd hosting** has no first‑party equivalent to the systemd /
+  Windows Service integration packages. We ship a `.plist` template plus a
+  small `LaunchdLifetime` service class wiring signals. ~50 lines.
+- **Contract compile‑verify loop** is ~200 lines of application code on top
+  of Semantic Kernel. Semantic Kernel does most of the work (structured
+  output, retries, validation); the domain‑specific verifier (schema check +
+  ontology check + scenario simulator) is ours to write once.
+
+Everything else is a first‑party Microsoft package or the de‑facto community
+standard, chosen deliberately to keep the amount of code we own small.
+
+### 16.5 What §16 deliberately does not do (yet)
+
+- Does not fix the parent UI kit (Blazor supports many — MudBlazor, Radzen,
+  Fluent UI Blazor — that's a Step B.5 decision, part of the parent inbox &
+  day‑in‑the‑life design).
+- Does not name a specific WebPush library on the Hub side (Step B.5).
+- Does not commit to a specific Ollama model or model size (that's part of
+  the analyzer / compile‑pipeline design, still open).
+- Does not commit to a specific structured‑output pattern (JSON‑schema mode
+  vs grammar‑constrained) — Semantic Kernel abstracts both; we pick per
+  backend at runtime.
+
 ---
 
-*Status: Step B item 1 landed as §15. Next action: brainstorm Step B item 2 —
-Hub parent authentication & pairing security parameters.*
+*Status: Step B items 1 and stack from item 2 landed as §15 and §16. Next
+action: complete Step B item 2 — the remaining auth details (session TTL,
+kid‑vs‑parent endpoint separation, pairing OTC parameters, mTLS PKI
+lifecycle), most of which are now smaller conversations because §16 delegates
+the plumbing.*

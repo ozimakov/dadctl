@@ -514,13 +514,8 @@ Each item below is its own brainstorming round (multiple choice → user decisio
 ones. The implementation plan only starts once these have landed.
 
 1. ~~**Cryptography & identity model**~~ — **landed as §15.**
-2. **Hub parent authentication & pairing security parameters** — auth model
-   details beyond password (§15.5 already covers password hygiene; this round
-   covers session management, CSRF, kid‑vs‑parent endpoint separation),
-   one‑time pairing code entropy/TTL/rate‑limit, mTLS PKI lifecycle (CA
-   protection, rotation, revocation, broker ACLs). Most of the auth
-   plumbing here is delegated to first‑party ASP.NET Core middleware per
-   §16, so this round is smaller than originally scoped.
+2. ~~**Hub parent authentication & pairing security parameters**~~ —
+   **landed as §17.**
 3. **Retention, erasure & operator legal roles** — GDPR/COPPA‑compatible
    deletion model on top of an append‑only event store, operator‑as‑controller
    framing, pre‑collection consent flow, kid‑facing privacy notice, third‑party
@@ -830,10 +825,218 @@ standard, chosen deliberately to keep the amount of code we own small.
   vs grammar‑constrained) — Semantic Kernel abstracts both; we pick per
   backend at runtime.
 
+## 17. Parent auth, sessions, pairing & broker PKI
+
+§15 fixed the crypto primitives and identity model. §16 named the components.
+This section pins down the four remaining operational choices from Step B.2:
+who the Hub's HTTP surface serves, how the parent stays logged in, how a new
+device gets its first signed credential, and how those credentials live and
+die on the MQTT broker. Numbers below are the shipping defaults; the tunable
+ones live in `hub.toml` with the ranges shown.
+
+### 17.1 Hub HTTP surface: parent‑only
+
+The Hub's HTTP/S API is exclusively for the parent PWA and for daemons
+performing pairing or PKI rotation. **Kids never authenticate against the
+Hub.** All kid‑facing UI (Today view, contract text, history, appeal form)
+is served by the local daemon (`dadctld`) from its own SQLite copy of applied
+contracts and appended events. When multi‑device history becomes a thing
+post‑MVP (§11), sibling devices sync via signed MQTT messages routed through
+the Hub, not through a kid‑authenticated HTTP call.
+
+Why: it collapses the Hub's auth surface to one well‑understood shape (adult
+web app), it makes the kid's UI work offline by construction, and it means a
+compromised Hub session cannot be used to *read* a kid's usage without also
+being able to sign parent‑role decisions — an attacker capability we already
+model in §8.
+
+### 17.2 Parent session & CSRF
+
+Cookie auth via first‑party ASP.NET Core middleware
+(`AddAuthentication().AddCookie()` + `AddAntiforgery()` per §16.3). Sessions
+are backed by a server‑side session table in the Hub's SQLite database so
+"sign out" and "sign out everywhere" actually invalidate — not just clear
+the cookie.
+
+Two session shapes, chosen at login:
+
+- **No "remember me"** (default at login prompt): session cookie only (dies
+  with the browser process), sliding 30 min idle, absolute 12 h cap,
+  `Secure; HttpOnly; SameSite=Strict`.
+- **"Remember me on this device"** (opt‑in checkbox): persistent cookie,
+  sliding 7 d idle, absolute 30 d cap, `SameSite=Lax`, server‑side session
+  row shown in a `Settings → Sessions` page with device / user‑agent / IP /
+  last‑seen and per‑row **Sign out** + a prominent **Sign out everywhere**
+  button.
+
+CSRF is not configurable. Every non‑GET request requires the ASP.NET Core
+antiforgery header token (`RequestVerificationToken`), user‑bound, rotated on
+login/logout and on privilege‑changing actions (password change, device
+revoke). A password change invalidates every other session for that user
+immediately.
+
+**Login rate limit.** 5 failed attempts / 15 min / account triggers a 5s
+server‑enforced delay on subsequent attempts; Argon2id verify time is the
+natural throttle above that. The account is **not** auto‑locked by default
+because there is no admin to unlock it — self‑hosted, single operator. An
+operator who wants a hard lockout can set `lockout_after_attempts` and
+recover via a Hub‑local CLI command that requires filesystem access to the
+Hub host (documented in `SECURITY.md`).
+
+**Tunables** (bounded; Hub refuses to boot on out‑of‑range values and logs
+the effective config at INFO):
+
+```toml
+[auth.session]
+short_idle_minutes       = 30    # range: 5..240
+short_absolute_hours     = 12    # range: 1..24
+remember_me_enabled      = true  # false = disable the checkbox entirely
+long_idle_days           = 7     # range: 1..30, must be < long_absolute_days
+long_absolute_days       = 30    # range: 1..90
+samesite_short           = "Strict"   # "Strict" | "Lax"
+samesite_long            = "Lax"      # "Strict" | "Lax"
+# CSRF: always on, always header token — not configurable
+
+[auth.login]
+max_failed_attempts      = 5     # range: 3..20
+failed_window_minutes    = 15    # range: 5..60
+lockout_after_attempts   = 0     # 0 = never lock; else 20..100
+throttle_delay_seconds   = 5     # range: 0..30
+```
+
+### 17.3 Device pairing (OTC)
+
+Bootstrap is one‑time and human‑mediated: the parent triggers pairing from
+the PWA, reads a short code to the kid, and the daemon exchanges the code
+for a signed device certificate (§15.7). This is the only step in the whole
+system where a not‑yet‑trusted daemon obtains a signed credential.
+
+**Flow.**
+
+1. Parent, authenticated in PWA, clicks **Pair a device**. Hub generates a
+   fresh 8‑digit numeric OTC (~27 bits of entropy), records
+   `{code_hash, created_at, expires_at, single_use=true, account_id}` in
+   SQLite, displays the code with a copy‑to‑clipboard button, a countdown,
+   and a warning: *"Read this to your kid in person. Do not paste it into
+   chat."*
+2. Kid launches the daemon's install wizard; it asks for Hub URL + code.
+3. Daemon generates its device Ed25519 keypair **locally** (private key
+   never leaves the device) and POSTs `{ device_pubkey, code,
+   device_metadata }` over TLS to `POST /v1/pair`.
+4. Hub validates the code (unexpired, unused, matches the account, within
+   rate limits), issues a 30‑day device certificate signed by the Hub CA
+   (§17.4), atomically marks the code redeemed, and returns
+   `{ device_cert, hub_pubkey, device_id }`.
+5. Daemon persists the cert and the Hub pubkey, opens the MQTT connection,
+   and the pairing UI on both ends transitions to "paired."
+
+**Parameters.**
+
+- **Entropy:** 8 decimal digits (~27 bits).
+- **TTL:** 10 minutes from generation.
+- **Single‑use:** first successful redemption invalidates.
+- **Rate limits:** 5 attempts per IP per 15 min, exponential backoff,
+  automatic lockout at 20 fails per account per hour. Every attempt
+  (success / failure) is written to the Hub audit log with `attempt_ip`,
+  `code_hash`, and outcome.
+- **Concurrent codes:** at most 3 unredeemed codes per account at once;
+  generating a 4th auto‑invalidates the oldest.
+
+**Known residual risk (accepted for MVP).** A hostile actor with LAN access
+who observes the parent reading the code has a real chance of redeeming it
+before the intended daemon does — rate limits do not defend against a
+single well‑timed attempt. This is accepted as an MVP‑scope tradeoff
+because the target audience (§10 developer‑parent beachhead, single
+household) puts the pairing window under direct physical parent supervision.
+Revisit if we ever widen the audience beyond single‑household deployments;
+the successor design is mutual key‑fingerprint confirmation à la Signal
+safety numbers, which we deliberately did **not** ship in MVP because it
+adds two UI states parents are demonstrably bad at reading.
+
+### 17.4 Broker PKI: Hub as internal CA, short‑lived device certs, offline grace
+
+The Hub is its own certificate authority. There is no external CA, no ACME,
+no dependency on public trust. All trust chains up to the Hub CA per §15.7.
+
+**CA storage.** Hub CA private key lives at
+`/var/lib/dadctl-hub/pki/ca.key`, mode `0600`, owner = the Hub process
+user. It is encrypted at rest with a key derived from an operator‑supplied
+passphrase (Argon2id, same parameters as §15.5). The passphrase is **not**
+stored on disk — the Hub prompts for it on interactive startup, or reads it
+from a systemd credential / Docker secret / Kubernetes secret at
+non‑interactive startup. **No HTTP endpoint ever exposes, uses, or accepts
+the CA private key.** Compromise of the CA key is the "everyone is fired"
+event; loss of it requires the operator to re‑pair every device (documented
+in `SECURITY.md`, and the reason the Hub UI nags the operator to write
+their passphrase down in a safe place at first‑run).
+
+**Device certificate lifecycle.**
+
+- **Algorithm:** Ed25519, same as everywhere else in §15.
+- **Validity:** 30 days from issuance.
+- **Auto‑renewal:** daemon renews at T‑7 days by presenting its current
+  (still‑valid) cert plus a fresh public key to `POST /v1/pki/rotate` over
+  mTLS. Renewal generates a fresh keypair on the device; the old key is
+  destroyed after successful rotation. Renewal windows overlap so a
+  short outage never bricks the device.
+- **Offline grace.** If the daemon cannot renew before expiry it enters
+  **offline grace**: keeps enforcing the last applied contract per §9,
+  refuses to publish new MQTT messages, surfaces a persistent kid‑side
+  banner ("This device hasn't checked in with the Hub in N days — your
+  parent will see this too") and a red "last seen" badge in the parent
+  PWA's device list. Grace is bounded — after 90 days total offline the
+  daemon locks the session and requires re‑pairing. The 30 / 7 / 90 numbers
+  are operator‑tunable in `hub.toml` but the Hub refuses key‑lifetime
+  values above a hard 365‑day ceiling baked into the code.
+- **Revocation.** Parent revokes a device from the PWA →  Hub writes to a
+  CRL file (`/var/lib/dadctl-hub/pki/crl.pem`) →  the Hub triggers a
+  Mosquitto config reload via `SIGHUP` → the daemon's MQTT connection is
+  refused on next reconnect and any in‑flight session is torn down. The
+  revocation is also written to the append‑only audit log.
+
+**Broker binding.** Mosquitto authenticates MQTT clients by client
+certificate: `CN = device_id`, issued by the Hub CA. Topic ACLs:
+
+- `hub/#` — writable only by the Hub's own broker principal.
+- `devices/{device_id}/#` — writable only by the client whose CN matches
+  `{device_id}`, readable by the Hub.
+- All other topics denied by default.
+
+This binding is not up for reinterpretation per‑install; it's how §5.4's
+separation‑of‑concerns claim (MQTT for delivery, TLS for confidentiality,
+signed envelopes for authenticity) actually holds together on the wire.
+
+**Tunables** (same startup validation as §17.2):
+
+```toml
+[pki.device_cert]
+validity_days            = 30    # range: 7..90
+renew_before_days        = 7     # range: 1..30, must be < validity_days
+offline_grace_days       = 90    # range: 7..365
+hard_key_lifetime_ceiling_days = 365   # not tunable; enforced in code
+```
+
+### 17.5 Deliberately deferred
+
+- **Multi‑parent / second‑parent accounts.** MVP stays at one parent
+  account per Hub (§10). The auth machinery here (per‑user session store,
+  per‑user antiforgery token binding) leaves room for more, but multi‑parent
+  raises its own questions — who can revoke whose device, who can approve
+  whose appeal, tie‑break on conflicting decisions — that belong in a
+  dedicated post‑MVP round, not this one.
+- **WebAuthn / passkey login.** §15.4 already reserved the authenticator
+  abstraction. The concrete flow (registration, cross‑device usage,
+  recovery when the sole authenticator dies) is a follow‑up round.
+- **Hub‑to‑Hub federation.** Out of scope forever unless someone shows up
+  with a use case; every simplification in this section assumes one Hub
+  per household.
+- **External CA / ACME for the Hub's HTTPS endpoint.** Orthogonal to §17.4
+  (which is only about the *internal* device PKI). Whether the Hub's
+  outward‑facing HTTPS cert comes from Let's Encrypt, a self‑signed cert,
+  or a corporate CA is an operator choice covered under §16 deployment
+  and Step B.6 onboarding.
+
 ---
 
-*Status: Step B items 1 and stack from item 2 landed as §15 and §16. Next
-action: complete Step B item 2 — the remaining auth details (session TTL,
-kid‑vs‑parent endpoint separation, pairing OTC parameters, mTLS PKI
-lifecycle), most of which are now smaller conversations because §16 delegates
-the plumbing.*
+*Status: Step B items 1 and 2 landed as §15, §16, and §17. Next action:
+Step B.3 — Retention, erasure & operator legal roles.*

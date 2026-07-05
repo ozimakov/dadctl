@@ -516,10 +516,10 @@ ones. The implementation plan only starts once these have landed.
 1. ~~**Cryptography & identity model**~~ — **landed as §15.**
 2. ~~**Hub parent authentication & pairing security parameters**~~ —
    **landed as §17.**
-3. **Retention, erasure & operator legal roles** — GDPR/COPPA‑compatible
-   deletion model on top of an append‑only event store, operator‑as‑controller
-   framing, pre‑collection consent flow, kid‑facing privacy notice, third‑party
-   LLM warning + opt‑in.
+3. ~~**Retention, erasure & operator legal roles**~~ — **landed as §18**
+   (scoped down to *data lifecycle & kid‑facing transparency*; the legal‑framing
+   parts were explicitly deprioritized — see §18.2 for the operator‑as‑controller
+   posture decision and §18.5 for what is deliberately deferred).
 4. **Developmental tiers & graduation** — banded UX (8–10 / 11–13 / 14–17),
    age‑banded contract templates, autonomy off‑ramp, crisis safe‑harbor
    categories that cannot be gated off, appeal grace‑window defaults,
@@ -1038,5 +1038,221 @@ hard_key_lifetime_ceiling_days = 365   # not tunable; enforced in code
 
 ---
 
-*Status: Step B items 1 and 2 landed as §15, §16, and §17. Next action:
-Step B.3 — Retention, erasure & operator legal roles.*
+## 18. Data lifecycle & kid‑facing transparency
+
+§7 made the event store append‑only and signed. §15 chained everything to
+signed identities. §17 pinned the auth surface. This section decides what
+happens to the data those layers accumulate: how long it lives, how it can
+be deleted, what the kid sees about it, and what happens when the parent
+switches the analyzer to a third‑party LLM.
+
+The B.3 round explicitly deprioritized *legal framing* (no `PRIVACY.md`, no
+controller/processor language, no jurisdiction talk). This section
+therefore covers only the operational and Principle 3 (transparency)
+obligations. §18.5 catalogues what is deliberately deferred.
+
+### 18.1 Retention & erasure
+
+Every event carries a **retention class** that decides its default
+lifetime. Deletion of any kind — automatic or manual — produces a signed
+`ErasureRecord` in the same append‑only chain as the events it removed.
+Nothing is ever silently gone.
+
+**Default retention windows** (all tunable in `hub.toml` within the bounds
+shown; Hub refuses to boot on out‑of‑range values):
+
+| Class | Default | Range | Notes |
+|---|---|---|---|
+| Raw `UsageEvent` | 90 d | 7 d .. 730 d | The high‑volume stuff; per‑minute app/session data. |
+| `Aggregate` (daily/weekly rollups) | 2 y | 30 d .. 10 y | Regenerated from raw events **before** the raw events are deleted, and signed at generation. |
+| `Issue` | 2 y | 90 d .. 10 y | Kept long enough to be referenced by later decisions. |
+| `Decision`, `Appeal`, `EnforcementRecord` | until "delete kid entirely" | ≥ 90 d floor | Cannot be selectively erased; only removed as part of a whole‑kid delete. |
+| `Contract`, `kid_acknowledgments`, `PrivacyNoticeAcknowledgment` | until "delete kid entirely" | ≥ 90 d floor | Same rationale — these are the record of what was agreed. |
+
+**Why the floors matter.** A parent who could delete a `Decision` right
+before their kid appeals it could effectively silence the appeal machinery.
+The 90 d floor on decisions and appeals guarantees the appeal‑grace window
+(§11 / Step B.4) is meaningful. The 7 d floor on raw usage prevents a
+parent from pre‑emptively wiping the evidence for an argument the kid is
+about to raise.
+
+**Automatic retention job.** A Quartz.NET job (§16.3) runs once per day. For
+each retention class past its window it:
+
+1. Regenerates and signs any `Aggregate` rows that depend on the raw events
+   about to be removed.
+2. Physically deletes the expired rows in a single SQLite transaction.
+3. Writes one signed `RetentionTombstone` event per (class, day) with
+   `{class, count, oldest_ts, newest_ts, retention_window_applied}`. The
+   tombstone content is deliberately shape‑only — no row contents survive.
+
+**Manual erasure.** Parent, from `Settings → Data`, can:
+
+- Delete raw usage events in a date range for a specific device (bounded
+  by the class floor).
+- Delete a whole kid — removes every event tied to that kid across every
+  class *except* the `ErasureRecord` itself and the Hub's copy of the
+  device certificate metadata (needed for the revocation ledger).
+
+Manual deletes always write a signed `ErasureRecord`
+`{scope, count, range, initiated_by, reason?}` — `reason` is a free‑text
+field, empty allowed, but the record exists either way.
+
+**The shared "Data changes" view.** Both the parent PWA and the kid‑side
+daemon UI expose a `History → Data changes` panel that lists every
+`RetentionTombstone`, `ErasureRecord`, and `PrivacyNoticeAcknowledgment`
+in chronological order. Same underlying data, same rendering, same
+timestamps on both sides. The kid can always answer the question "what
+happened to my data" without asking the parent.
+
+### 18.2 Legal‑framing posture: silent‑by‑design, transparency preserved
+
+The dadctl project deliberately does **not** ship:
+
+- a `PRIVACY.md` at the repo root,
+- a controller/processor framing document,
+- jurisdiction‑specific templates (GDPR / COPPA / CCPA / other),
+- any language purporting to advise operators on their legal obligations.
+
+The self‑hosted operator (usually a parent) is the person on the hook for
+whatever regime applies to them; the project ships software and does not
+practice law. Operators who need those artifacts can produce them
+themselves.
+
+This is a scope decision, not a values decision. It does **not** relax any
+Principle 3 (transparency to the kid) obligation. Kid‑facing transparency
+is enforced by the daemon's own behaviour, described in §18.3 and §18.4.
+Losing the legal artifacts costs the project nothing on the transparency
+axis because the kid‑facing transparency has never depended on legal
+framing to work.
+
+### 18.3 Pre‑collection kid‑facing transparency
+
+At first daemon run, and on any material change to what is collected, the
+daemon renders a **data transparency screen** to the kid and refuses to
+collect until the kid taps **Acknowledge**. Refusal (or dismissal without
+acknowledging) puts the daemon into a **no‑collection** state:
+
+- No `UsageEvent` is written locally or published to MQTT.
+- Contract enforcement (Limits, Gates) still runs — those are protective,
+  not observational.
+- Hub PWA surfaces a persistent red badge on that device: *"Kid has not
+  acknowledged the current data notice — no usage data is being collected
+  for this device."*
+
+**Material changes that trigger a re‑ack** (i.e. a new
+`PrivacyNoticeAcknowledgment` must be signed before collection resumes):
+
+- Retention window for any class **lengthened** (shortening is silent).
+- LLM backend changed (Ollama ↔ third‑party ↔ rules‑only).
+- A new data category is added to what the daemon collects (i.e. a daemon
+  update that widens the collection surface).
+- The Hub URL changes.
+
+Acknowledgment record shape (extends the §7 append‑only chain):
+
+```
+PrivacyNoticeAcknowledgment {
+  device_id,
+  ts,
+  daemon_version,
+  notice_baseline_hash,   // hash of the machine-generated facts panel per §18.4
+  notice_addendum_hash,   // hash of the operator addendum per §18.4, or null
+  hub_config_hash,        // retention windows + backend + LLM payload profile snapshot
+  kid_sig                 // per §15
+}
+```
+
+The three separate hashes are what let a future auditor (parent, kid,
+open‑source contributor investigating a bug report) reconstruct *exactly*
+what the kid saw, and distinguish between "the software's factual claims
+about itself" and "the operator's supplementary note."
+
+**Carve‑out to §12.1.** §12.1 committed that the LLM backend identity is
+not surfaced in the kid's *normal history view* (the kid sees reasoning,
+not "GPT‑4o said X"). §18.3 is the scoped exception: on the re‑ack screen
+specifically, the current backend is named plainly, because the whole
+point of the re‑ack is that the tradeoff has changed. This is a
+one‑screen carve‑out, not a general reversal of §12.1.
+
+### 18.4 Notice content: machine‑generated facts panel + operator addendum
+
+The kid‑facing transparency screen has two parts, rendered top‑to‑bottom
+in that order, visually separated by a header break:
+
+**Part 1 — the facts panel (baked, non‑editable).**
+
+Generated by the daemon at render time from its own code and the Hub's
+current config. 5–8 short bullets, plain language, ~grade 5 reading level.
+Fixed structure:
+
+- What data categories are collected (app names, per‑app minutes, session
+  start/stop, screen unlock events, etc. — from the daemon's actual
+  registered collectors, not from a static string).
+- Where it goes (Hub URL as configured, LLM backend as configured).
+- How long each category is kept (retention windows from `hub.toml`).
+- What runs on the kid's device vs. what runs on the Hub vs. what leaves
+  the household (explicit note if third‑party LLM is enabled per §17.3 /
+  §18.5).
+- Where to see what happened to the data ("open History → Data changes").
+- What the kid can do (link to appeal, link to see the current contract).
+
+No legal words. No jurisdiction talk. No "we care about your privacy"
+marketing prose. Just facts about what this specific installation does.
+
+**Part 2 — the operator addendum (free‑form, capped, clearly labeled).**
+
+Rendered below the facts panel under a header that reads exactly
+*"A note from the person who set up this system:"* (localized). Operator
+supplies this via `hub.toml` (`[privacy_notice] addendum = "..."`) or via
+the PWA. Constraints:
+
+- Length‑capped: 4 KB (~600 words).
+- Plain text with a small Markdown subset (paragraphs, links, lists — no
+  images, no scripts, no HTML pass‑through).
+- Cannot rewrite, hide, or visually compete with the facts panel; UI style
+  is fixed by the daemon.
+- Empty addendum is a valid state — the header does not render if the
+  addendum is empty.
+
+The facts panel hash and the addendum hash are recorded separately in the
+acknowledgment record (§18.3). An operator with an addendum in place
+cannot silently substitute a different addendum without generating a new
+acknowledgment cycle, because the addendum hash change is detected on
+next daemon start.
+
+**Localization.** Both the facts panel labels and the operator addendum
+render in the daemon's UI language. MVP ships facts‑panel text in English;
+the daemon's i18n scaffolding leaves room for community translations to
+land as PRs. Operator addendum is not translated by the daemon — operators
+who need bilingual households can supply pre‑translated text.
+
+### 18.5 What §18 deliberately does not do (yet)
+
+- **No third‑party legal artifacts.** No `PRIVACY.md`, no controller /
+  processor framing, no jurisdiction templates. Operators who need these
+  produce them themselves. Reopen if a jurisdiction (or a lawsuit) makes
+  the current posture untenable.
+- **No kid veto on privacy‑degrading changes.** The kid can refuse to
+  acknowledge (which stops collection on their device — a real signal),
+  but has no mechanism to prevent the parent from *making* the change in
+  the first place. Kid veto is fundamentally an age‑banded question — 9
+  and 16 want very different things — and belongs in Step B.4
+  (developmental tiers), not here.
+- **No cross‑Hub / cross‑household portability of the erasure ledger.**
+  MVP is one Hub per household; if we ever ship federation or export,
+  ledger portability comes with it.
+- **No forensic evidence lock.** If a parent wants a `Decision` or
+  `Appeal` preserved past the "delete kid entirely" flow (e.g. for a
+  custody dispute), that's a separate feature that has to be designed
+  carefully so it does not become a general‑purpose "keep everything
+  about my kid forever" escape hatch. Not in MVP.
+- **No third‑party LLM data‑residency controls beyond the payload
+  profile.** §17.3 minimizes what leaves the household; §18 does not
+  additionally offer "route my third‑party LLM traffic via country X."
+  Operators who need that use their own network stack.
+
+---
+
+*Status: Step B items 1, 2, and 3 landed as §15, §16, §17, and §18. Next
+action: Step B.4 — Developmental tiers & graduation.*
